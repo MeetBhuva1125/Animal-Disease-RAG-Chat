@@ -6,20 +6,21 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
+from langchain.chains import RetrievalQA
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 import uvicorn
-from typing import Dict, List
+from typing import Dict
 import os
 
 # Initialize FastAPI app
 app = FastAPI(title="Animal Disease RAG API")
 
+# Simplified Pydantic models
 class Query(BaseModel):
     question: str
 
 class RAGResponse(BaseModel):
     answer: str
-    sources: List[str]
     metrics: Dict
 
 # Initialize global variables
@@ -28,12 +29,9 @@ rag_chain = None
 tokenizer = None
 
 def load_and_process_data(csv_path: str):
-    """Load and process the CSV data into documents"""
-    # Load CSV data
     loader = CSVLoader(file_path=csv_path, encoding='utf-8')
     documents = loader.load()
     
-    # Split documents
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200
@@ -42,12 +40,10 @@ def load_and_process_data(csv_path: str):
     return split_docs
 
 def initialize_vector_store(documents, save_path: str = "FAISS"):
-    """Initialize and save the vector store"""
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-mpnet-base-v2"
     )
     
-    # Create and save vector store
     vector_store = FAISS.from_documents(
         documents,
         embedding_model
@@ -79,7 +75,7 @@ def initialize_model():
         )
     
     # Initialize model
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    model_name = "tiiuae/falcon-7b-instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
     # 8-bit configuration
@@ -90,7 +86,7 @@ def initialize_model():
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
-        quantization_config=None#bnb_config,
+        quantization_config=bnb_config,
     )
     
     # Initialize pipeline
@@ -98,7 +94,7 @@ def initialize_model():
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=500,
+        max_new_tokens=50,
         do_sample=True,
         return_full_text=False
     )
@@ -162,16 +158,6 @@ async def ask_question(query: Query):
         tokens = tokenizer(result["result"], return_tensors="pt").input_ids.shape[1]
         tokens_per_second = tokens / time_taken
         
-        # Format sources with more context
-        sources = []
-        for doc in result["source_documents"][:2]:
-            source_text = doc.page_content
-            metadata = doc.metadata if hasattr(doc, 'metadata') else {}
-            sources.append({
-                "content": source_text,
-                "metadata": metadata
-            })
-        
         # Prepare metrics
         metrics = {
             "time_taken": round(time_taken, 2),
@@ -181,7 +167,6 @@ async def ask_question(query: Query):
         
         return RAGResponse(
             answer=result["result"],
-            sources=sources,
             metrics=metrics
         )
         
