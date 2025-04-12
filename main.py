@@ -38,10 +38,12 @@ class Query(BaseModel):
 class RAGResponse(BaseModel):
     answer: str
     metrics: Dict
+    source_type: str  # Added to indicate whether response is from RAG or general knowledge
 
 # Global variables
 vector_store = None
 rag_chain = None
+llm = None  # Added to store the Gemini LLM for direct access
 
 def load_documents(csv_path: str):
     """Load documents from CSV file"""
@@ -99,7 +101,7 @@ def setup_gemini_llm():
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.0-flash-lite", 
         google_api_key=api_key,
-        temperature=0.2,
+        temperature=0.4,
         max_output_tokens=512
     )
     
@@ -133,10 +135,10 @@ def create_rag_chain(vector_store, llm):
 
 def initialize_model():
     """Initialize the RAG model with all components"""
-    global vector_store, rag_chain
+    global vector_store, rag_chain, llm
     
     # Check if data exists and load it
-    csv_path = "Animal disease spreadsheet - Sheet1.csv"
+    csv_path = "Animal_disease.csv"
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Dataset not found at {csv_path}")
     
@@ -153,7 +155,80 @@ def initialize_model():
     # Create RAG chain
     rag_chain = create_rag_chain(vector_store, llm)
 
+def is_disease_specific_question(question: str) -> bool:
+    """
+    Determine if a question is specifically about animal diseases (RAG dataset)
+    or a general veterinary question.
+    
+    Args:
+        question: The user's question
+        
+    Returns:
+        bool: True if disease-specific, False if general veterinary question
+    """
+    # Define disease-related keywords that would indicate we should use RAG
+    disease_keywords = [
+        "disease", "infection", "syndrome", "pathogen", "bacteria", "virus", 
+        "fungal", "parasite", "symptom", "treatment", "prognosis", "outbreak",
+        "epidemic", "transmission", "contagious", "vaccine", "mortality",
+        "lesion", "diagnosis", "antibiotic", "antiviral", "fever", "infection",
+        "contamination", "pathology", "incubation"
+    ]
+    
+    # Convert question to lowercase for case-insensitive matching
+    question_lower = question.lower()
+    
+    # Check if any disease keywords are in the question
+    if any(keyword in question_lower for keyword in disease_keywords):
+        return True
+    
+    return False
 
+async def get_general_veterinary_answer(question: str):
+    """
+    Handle general veterinary questions using Gemini directly
+    
+    Args:
+        question: The user's question
+        
+    Returns:
+        str: The answer from Gemini
+    """
+    global llm
+    
+    # If LLM not initialized, do it now
+    if llm is None:
+        llm = setup_gemini_llm()
+    
+    # Create a prompt template for general veterinary questions
+    general_vet_prompt = PromptTemplate.from_template(
+        """ You are a veterinary assistant providing information about animals and animal care.
+
+        FIRST, explicitly evaluate if the question is about animals or veterinary topics:
+        
+        Step 1: SCOPE CHECK 
+        - Is this question about animals, animal care, veterinary medicine, pet ownership, livestock management, wildlife, or any animal-related topic?
+        - If NO, respond ONLY with: "I'm sorry, I can only answer questions related to animals and veterinary topics."
+        - If YES, proceed to Step 2.
+        
+        Step 2: ANSWER FORMATION (only if Step 1 is YES)
+        - Provide a clear, concise, and helpful answer about the animal-related topic.
+        - Focus on factual information and best practices in veterinary care.
+        - Avoid speculating or giving definitive medical advice that should come from a licensed veterinarian.
+        - For serious medical conditions, recommend consulting a veterinarian.
+        
+        Question: {question}
+        
+        Answer:"""
+    )
+    
+    # Format the prompt with the question
+    formatted_prompt = general_vet_prompt.format(question=question)
+    
+    # Get response from Gemini
+    response = await llm.ainvoke(formatted_prompt)
+    
+    return response.content
 
 @app.get("/")
 async def root():
@@ -166,7 +241,7 @@ async def root():
 @app.post("/ask", response_model=RAGResponse)
 async def ask_question(query: Query):
     """Endpoint to answer veterinary questions"""
-    if not rag_chain:
+    if not rag_chain or not llm:
         try:
             initialize_model()
         except Exception as e:
@@ -176,26 +251,35 @@ async def ask_question(query: Query):
         # Measure performance
         start_time = time.time()
         
-        # Get response from RAG chain
-        result = rag_chain.invoke({"query": query.question})
+        # Determine if this is a disease-specific question or general veterinary question
+        if is_disease_specific_question(query.question):
+            # Get response from RAG chain for disease-specific questions
+            result = rag_chain.invoke({"query": query.question})
+            answer = result["result"]
+            source_type = "rag_database"
+        else:
+            # Get response from general veterinary knowledge
+            answer = await get_general_veterinary_answer(query.question)
+            source_type = "general_knowledge"
         
         # Calculate metrics
         end_time = time.time()
         time_taken = end_time - start_time
         
-        # Prepare metrics (no token count since we're using API)
+        # Prepare metrics
         metrics = {
             "time_taken": round(time_taken, 2),
             "model": "gemini-2.0-flash-lite"
         }
         
         return RAGResponse(
-            answer=result["result"],
-            metrics=metrics
+            answer=answer,
+            metrics=metrics,
+            source_type=source_type
         )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run("main(gemini ver):app", host="localhost", port=8000, reload=True)
+    uvicorn.run("main:app", host="localhost", port=8000, reload=True)

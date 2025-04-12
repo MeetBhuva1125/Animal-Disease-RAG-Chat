@@ -2,3 +2,4 @@
 Sources.txt
 __pycache__
 .env
+main(gemini_ver).py
